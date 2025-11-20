@@ -1,0 +1,3 @@
+[submodule "attn/sliding_tile_attn/tk"]
+	path = attn/sliding_tile_attn/tk
+	url = https://github.com/HazyResearch/ThunderKittens.git
