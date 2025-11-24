@@ -9,12 +9,6 @@ Recommended Docker Containers
 - ghcr.io/hao-ai-lab/fastvideo/fastvideo-dev:py3.12-latest
 - nvcr.io/nvidia/pytorch:25.01-py3(with nvcc12.8, higher version will cause some compile errors)
 
-## performance(H100)
-| Case        | flex_attention(ms) | tk kernel(ms) | triton kernel(ms) |
-| :---------- | :--------- | :---------- | :---------- |
-| B=2, H=24, N=69120, D=128, kernel=[3, 6, 10] | 302.23 | 206.48 | 504.24 |
-| B=2, H=24, N=82944, D=128, kernel=[3, 3, 6]  | 108.11 | 91.23  | 184.32 |
-
 # For MI3XX
 ## Triton
 ### implement
@@ -30,6 +24,13 @@ Recommended Docker Containers
 
 ## HipKitten(not yet)
 [HipKitten](https://github.com/HazyResearch/HipKittens)
+
+# Performance
+## performance(H100)
+| Case        | flex_attention(ms) | tk kernel(ms) | triton kernel(ms) |
+| :---------- | :--------- | :---------- | :---------- |
+| B=2, H=24, N=69120, D=128, kernel=[3, 6, 10] | 302.23 | 206.48 | 504.24 |
+| B=2, H=24, N=82944, D=128, kernel=[3, 3, 6]  | 108.11 | 91.23  | 184.32 |
 
 ## performance(MI300X)
 | Case        | flex_attention(ms) |  triton kernel(ms) |

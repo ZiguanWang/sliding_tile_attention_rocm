@@ -1,4 +1,5 @@
 import torch
+import math
 import sys
 import os
 
@@ -14,16 +15,22 @@ from tqdm import tqdm
 flex_attention = torch.compile(flex_attention, dynamic=False)
 
 
-def flex_test(Q, K, V, kernel_size):
-    mask = get_sliding_tile_attention_mask(kernel_size, (6, 8, 8), (18, 48, 80), 0, 'cuda', 0)
+def flex_test(Q, K, V, dit_seq_shape, kernel_size, text_length):
+    dit_seq_shape_mapping = {
+        '30x48x80':(30, 48, 80),   # Hunyuan   115200 (6x8x8)(5*6*6)  has_text
+        '36x48x48':(36, 48, 48),   # Wan       82944  (6x8x8)(6*6*6)  no_text
+        '18x48x80':(18, 48, 80),   # Stepvideo 69120  (6x8x8)(3*6*10) no_text
+    }
+    mask = get_sliding_tile_attention_mask(kernel_size, (6, 8, 8), dit_seq_shape_mapping[dit_seq_shape], text_length, 'cuda', text_length)
     output = flex_attention(Q, K, V, block_mask=mask)
 
     return output
 
 
-def triton_fwd_kernel_test(Q, K, V, kernel_size):
-    o = triton_sliding_tile_attention(Q, K, V, [kernel_size] * 24, 0, False, '18x48x80')
+def triton_fwd_kernel_test(Q, K, V, dit_seq_shape, kernel_size, text_length):
+    o = triton_sliding_tile_attention(Q, K, V, kernel_size, text_length, text_length > 0, dit_seq_shape)
     return o
+
 
 def generate_tensor(shape, mean, std, dtype, device):
     tensor = torch.randn(shape, dtype=dtype, device=device)
@@ -34,7 +41,7 @@ def generate_tensor(shape, mean, std, dtype, device):
     return scaled_tensor.contiguous()
 
 
-def check_correctness(b, h, n, d, causal, mean, std, num_iterations=50, error_mode='all'):
+def check_correctness(b, h, n, d, causal, dit_seq_shape, window_size, text_length, mean, std, num_iterations=50):
     results = {
         'TRITON vs FLEX': {
             'sum_diff': 0,
@@ -42,34 +49,27 @@ def check_correctness(b, h, n, d, causal, mean, std, num_iterations=50, error_mo
             'max_diff': 0
         },
     }
-    kernel_size_ls = [(3, 3, 5), (3, 1, 10)]
 
-    from tqdm import tqdm
-    for kernel_size in tqdm(kernel_size_ls):
-        for _ in range(num_iterations):
-            torch.manual_seed(0)
+    for _ in range(num_iterations):
+        torch.manual_seed(0)
 
-            Q = generate_tensor((b, h, n, d), mean, std, torch.bfloat16, 'cuda')
-            K = generate_tensor((b, h, n, d), mean, std, torch.bfloat16, 'cuda')
-            V = generate_tensor((b, h, n, d), mean, std, torch.bfloat16, 'cuda')
-            triton_o = triton_fwd_kernel_test(Q, K, V, kernel_size)
-            pt_o = flex_test(Q, K, V, kernel_size)
+        Q = generate_tensor((b, h, n + text_length, d), mean, std, torch.bfloat16, 'cuda')
+        K = generate_tensor((b, h, n + text_length, d), mean, std, torch.bfloat16, 'cuda')
+        V = generate_tensor((b, h, n + text_length, d), mean, std, torch.bfloat16, 'cuda')
+        triton_o = triton_fwd_kernel_test(Q, K, V, dit_seq_shape, [window_size] * h, text_length)
+        pt_o = flex_test(Q, K, V, dit_seq_shape, window_size, text_length)
 
-            diff = pt_o - triton_o
-            abs_diff = torch.abs(diff)
-            results['TRITON vs FLEX']['sum_diff'] += torch.sum(abs_diff).item()
-            results['TRITON vs FLEX']['max_diff'] = max(results['TRITON vs FLEX']['max_diff'], torch.max(abs_diff).item())
+        diff = pt_o - triton_o
+        abs_diff = torch.abs(diff)
+        results['TRITON vs FLEX']['sum_diff'] += torch.sum(abs_diff).item()
+        results['TRITON vs FLEX']['max_diff'] = max(results['TRITON vs FLEX']['max_diff'], torch.max(abs_diff).item())
 
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
-        print("max_diff", torch.max(abs_diff).item())
-        print(
-            "avg_diff",
-            torch.sum(abs_diff).item() / (b * h * n * d *
-                                          (1 if error_mode == 'output' else 3 if error_mode == 'backward' else 4)))
+    print("max_diff", torch.max(abs_diff).item())
+    print("avg_diff", torch.sum(abs_diff).item() / (b * h * n * d * 1))
 
-    total_elements = b * h * n * d * num_iterations * (1 if error_mode == 'output' else
-                                                       3 if error_mode == 'backward' else 4) * len(kernel_size_ls)
+    total_elements = b * h * (n + text_length) * d * num_iterations * 1
     for name, data in results.items():
         avg_diff = data['sum_diff'] / total_elements
         max_diff = data['max_diff']
@@ -78,16 +78,29 @@ def check_correctness(b, h, n, d, causal, mean, std, num_iterations=50, error_mo
     return results
 
 
-# Example usage
-b, h, d = 2, 24, 128
-n = 69120  # Sequence length
-causal = False
-mean = 1e-1
-std = 10
+def test_attention(configurations):
+    for B, H, N, D, causal, dit_seq_shape, window_size, text_length in configurations:
+        print("=" * 60)
+        print(f"forward pass for B={B}, H={H}, N={N}, D={D}, causal={causal}, dit_seq_shape={dit_seq_shape}, window_size={window_size}, text_length={text_length}")
 
-# Run correctness check directly
-results = check_correctness(b, h, n, d, causal, mean, std, num_iterations=50, error_mode='output')
-assert results['TRITON vs FLEX']['avg_diff'] < 3e-6, f"Average difference: {results['TRITON vs FLEX']['avg_diff']} is too large"
-assert results['TRITON vs FLEX']['max_diff'] < 4e-2, f"Maximum difference: {results['TRITON vs FLEX']['max_diff']} is too large"
-print(f"Average difference: {results['TRITON vs FLEX']['avg_diff']}")
-print(f"Maximum difference: {results['TRITON vs FLEX']['max_diff']}")
+        mean = 1e-1
+        std = 10
+
+        # Run correctness check directly
+        results = check_correctness(B, H, N, D, causal, dit_seq_shape, window_size, text_length, mean, std, num_iterations=50)
+        assert results['TRITON vs FLEX']['avg_diff'] < 4e-6, f"Average difference: {results['TRITON vs FLEX']['avg_diff']} is too large"
+        assert results['TRITON vs FLEX']['max_diff'] < 4e-2, f"Maximum difference: {results['TRITON vs FLEX']['max_diff']} is too large"
+        print(f"Average difference: {results['TRITON vs FLEX']['avg_diff']}")
+        print(f"Maximum difference: {results['TRITON vs FLEX']['max_diff']}")
+
+
+configurations = [
+    (2, 24, 69120,  128, False, '18x48x80', (3, 3, 5),  0),   # Stepvideo
+    (2, 24, 69120,  128, False, '18x48x80', (3, 1, 10), 0),   # Stepvideo
+    (2, 24, 82944,  128, False, '36x48x48', (3, 3, 6),  0),   # Wan
+    (2, 24, 82944,  128, False, '36x48x48', (3, 1, 6),  0),   # Wan
+    (2, 24, 115200, 128, False, '30x48x80', (3, 3, 6),  128), # Hunyuan
+    (2, 24, 115200, 128, False, '30x48x80', (3, 3, 6),  256), # Hunyuan
+]
+
+test_attention(configurations)

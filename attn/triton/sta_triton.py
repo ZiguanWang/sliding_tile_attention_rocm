@@ -45,9 +45,35 @@ def clamp_int(value, min, max):
     return ret
 
 
+@triton.jit
+def _attn_fwd_loop(
+    q, k, v, kv_mask, m, l, acc, sm_scale,
+    MASK_KV: tl.constexpr,
+):
+    scores = tl.dot(q, k.T) #[BLOCK_Q, BLOCK_KV]
+    scores = scores * sm_scale
+    if MASK_KV:
+        scores = tl.where(kv_mask[None, :], scores, -float('inf'))
+
+    current_m = tl.max(scores, axis=1)
+    new_m = tl.maximum(m, current_m)
+    exp_scores = tl.math.exp2(scores - new_m[:, None])
+    current_l = tl.sum(exp_scores, axis=1)
+
+    # Update L <- L * exp(M - M') + L1, M <- M'
+    alpha = tl.math.exp2(m - new_m)
+    l = l * alpha + current_l
+    m = new_m
+
+    # Update O <- O * exp(M - M') + P @ V
+    acc = (acc * alpha[:, None] + tl.dot(exp_scores.to(v.type.element_ty), v))
+
+    return m, l, acc
+
+
 @triton.autotune(
     configs=get_autotune_config(),
-    key=['head_dim', 'img_seq_len'],
+    key=['head_dim'],
 )
 @triton.jit
 def triton_sta_kernel(
@@ -59,6 +85,8 @@ def triton_sta_kernel(
     kernel_t: int, kernel_h: int, kernel_w: int,
     tile_t: int, tile_h: int, tile_w: int,
     scale: float,
+    has_text: tl.constexpr,
+    text_q: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_KV: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
@@ -68,15 +96,22 @@ def triton_sta_kernel(
 
     batch_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
-    q_tile_flat = tl.program_id(2) // q_block_per_tile
-    q_block_idx = tl.program_id(2) % q_block_per_tile
+    if text_q:
+        q_block_idx = tl.program_id(2)
+    else:
+        q_tile_flat = tl.program_id(2) // q_block_per_tile
+        q_block_idx = tl.program_id(2) % q_block_per_tile
 
     m = tl.full((BLOCK_Q,), -float('inf'), dtype=tl.float32)
     l = tl.zeros((BLOCK_Q,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_Q, BLOCK_DIM), dtype=tl.float32)
 
     q_offset = (batch_idx * num_heads + head_idx) * seq_len * head_dim
-    q_base_idx = q_tile_flat * total_tile_size + q_block_idx * BLOCK_Q
+    if text_q:
+        q_base_idx = img_seq_len + q_block_idx * BLOCK_Q
+    else:
+        q_base_idx = q_tile_flat * total_tile_size + q_block_idx * BLOCK_Q
+
     q_offset_in_tile = tl.arange(0, BLOCK_Q)
     q_idx = q_base_idx + q_offset_in_tile
     q_mask = (q_block_idx * BLOCK_Q + tl.arange(0, BLOCK_Q)) < total_tile_size
@@ -95,27 +130,39 @@ def triton_sta_kernel(
     num_tiles_w = canvas_w // tile_w
     tiles_per_hw = num_tiles_h * num_tiles_w
 
-    q_tile_t = q_tile_flat // tiles_per_hw
-    remaining = q_tile_flat % tiles_per_hw
-    q_tile_h = remaining // num_tiles_w
-    q_tile_w = remaining % num_tiles_w
+    if text_q:
+        kv_tile_start_t = 0
+        kv_tile_end_t = num_tiles_t
 
-    kernel_center_t = clamp_int(q_tile_t, kernel_t // 2, (num_tiles_t - 1) - kernel_t // 2)
-    kernel_center_h = clamp_int(q_tile_h, kernel_h // 2, (num_tiles_h - 1) - kernel_h // 2)
-    kernel_center_w = clamp_int(q_tile_w, kernel_w // 2, (num_tiles_w - 1) - kernel_w // 2)
+        kv_tile_start_h = 0
+        kv_tile_end_h = num_tiles_h
 
-    kv_tile_start_t = kernel_center_t - kernel_t // 2
-    kv_tile_end_t = kernel_center_t + kernel_t // 2 + 1
-    kv_tile_end_t = tl.where(kv_tile_end_t > num_tiles_t, num_tiles_t, kv_tile_end_t)
+        kv_tile_start_w = 0
+        kv_tile_end_w = num_tiles_w
 
-    kv_tile_start_h = kernel_center_h - kernel_h // 2
-    kv_tile_end_h = kernel_center_h + kernel_h // 2 + 1
-    kv_tile_end_h = tl.where(kv_tile_end_h > num_tiles_h, num_tiles_h, kv_tile_end_h)
+    else:
+        q_tile_t = q_tile_flat // tiles_per_hw
+        remaining = q_tile_flat % tiles_per_hw
+        q_tile_h = remaining // num_tiles_w
+        q_tile_w = remaining % num_tiles_w
 
-    kv_tile_start_w = kernel_center_w - kernel_w // 2
-    kv_tile_end_w = kernel_center_w + kernel_w // 2 + 1
-    kv_tile_end_w = tl.where(kv_tile_end_w > num_tiles_w, num_tiles_w, kv_tile_end_w)
+        kernel_center_t = clamp_int(q_tile_t, kernel_t // 2, (num_tiles_t - 1) - kernel_t // 2)
+        kernel_center_h = clamp_int(q_tile_h, kernel_h // 2, (num_tiles_h - 1) - kernel_h // 2)
+        kernel_center_w = clamp_int(q_tile_w, kernel_w // 2, (num_tiles_w - 1) - kernel_w // 2)
 
+        kv_tile_start_t = kernel_center_t - kernel_t // 2
+        kv_tile_end_t = kernel_center_t + kernel_t // 2 + 1
+        kv_tile_end_t = tl.where(kv_tile_end_t > num_tiles_t, num_tiles_t, kv_tile_end_t)
+
+        kv_tile_start_h = kernel_center_h - kernel_h // 2
+        kv_tile_end_h = kernel_center_h + kernel_h // 2 + 1
+        kv_tile_end_h = tl.where(kv_tile_end_h > num_tiles_h, num_tiles_h, kv_tile_end_h)
+
+        kv_tile_start_w = kernel_center_w - kernel_w // 2
+        kv_tile_end_w = kernel_center_w + kernel_w // 2 + 1
+        kv_tile_end_w = tl.where(kv_tile_end_w > num_tiles_w, num_tiles_w, kv_tile_end_w)
+
+    # for kv_img
     for kv_tile_t in tl.range(kv_tile_start_t, kv_tile_end_t):
         for kv_tile_h in tl.range(kv_tile_start_h, kv_tile_end_h):
             for kv_tile_w in tl.range(kv_tile_start_w, kv_tile_end_w):
@@ -139,21 +186,32 @@ def triton_sta_kernel(
                         other=0.0
                     )  # [BLOCK_KV, BLOCK_DIM]
 
-                    scores = tl.dot(q, k.T)
-                    scores = scores * sm_scale
+                    m, l, acc = _attn_fwd_loop(q, k, v, kv_mask, m, l, acc, sm_scale, False)
 
-                    current_m = tl.max(scores, axis=1)
-                    new_m = tl.maximum(m, current_m)
-                    exp_scores = tl.math.exp2(scores - new_m[:, None])
-                    current_l = tl.sum(exp_scores, axis=1)
 
-                    # Update L <- L * exp(M - M') + L1, M <- M'
-                    alpha = tl.math.exp2(m - new_m)
-                    l = l * alpha + current_l
-                    m = new_m
+    # for kv_text
+    if has_text:
+        kv_base_idx = img_seq_len
+        for kv_block_idx in tl.range(0, total_tile_size, BLOCK_KV):
+            kv_offset_in_block = tl.arange(0, BLOCK_KV)
+            kv_idx = kv_base_idx + kv_block_idx + kv_offset_in_block
+            kv_mask = (kv_block_idx + tl.arange(0, BLOCK_KV)) < text_length
 
-                    # Update O <- O * exp(M - M') + P @ V
-                    acc = (acc * alpha[:, None] + tl.dot(exp_scores.to(v.type.element_ty), v))
+            kv_offset = (batch_idx * num_heads + head_idx) * seq_len * head_dim
+
+            k = tl.load(
+                K + kv_offset + kv_idx[:, None] * head_dim + tl.arange(0, BLOCK_DIM)[None, :],
+                mask=kv_mask[:, None],
+                other=0.0
+            )  # [BLOCK_KV, BLOCK_DIM]
+            v = tl.load(
+                V + kv_offset + kv_idx[:, None] * head_dim + tl.arange(0, BLOCK_DIM)[None, :],
+                mask=kv_mask[:, None],
+                other=0.0
+            )  # [BLOCK_KV, BLOCK_DIM]
+
+            m, l, acc = _attn_fwd_loop(q, k, v, kv_mask, m, l, acc, sm_scale, True)
+
 
     output_acc = acc / l[:, None]
     tl.store(
@@ -219,7 +277,8 @@ def triton_sliding_tile_attention(
 
     output = torch.empty_like(q)
 
-    # triton_sta_kernel[(batch_size, num_heads, num_tiles * triton.cdiv(total_tile_size,BLOCK_Q))](
+    # for q_img
+    # triton_sta_kernel[(batch_size, num_heads, num_tiles * triton.cdiv(total_tile_size, BLOCK_Q))](
     grid = lambda META: (batch_size, num_heads, num_tiles * triton.cdiv(total_tile_size, META['BLOCK_Q']))
     triton_sta_kernel[grid](
         q, k, v, output,
@@ -230,9 +289,35 @@ def triton_sliding_tile_attention(
         kernel_t, kernel_h, kernel_w,
         tile_t, tile_h, tile_w,
         scale=1.0 / (head_dim ** 0.5),
+        has_text=has_text,
+        text_q=False,
         # BLOCK_Q=BLOCK_Q,
         # BLOCK_KV=BLOCK_KV,
         BLOCK_DIM=BLOCK_DIM,
     )
+
+    # for q_text
+    if has_text:
+        # triton_sta_kernel[(batch_size, num_heads, triton.cdiv(total_tile_size, BLOCK_Q))](
+        grid = lambda META: (batch_size, num_heads, triton.cdiv(total_tile_size, META['BLOCK_Q']))
+        triton_sta_kernel[grid](
+            q, k, v, output,
+            batch_size, num_heads, seq_len, head_dim,
+            img_seq_len,
+            text_length,
+            canvas_t, canvas_h, canvas_w,
+            kernel_t, kernel_h, kernel_w,
+            tile_t, tile_h, tile_w,
+            scale=1.0 / (head_dim ** 0.5),
+            has_text=has_text,
+            text_q=True,
+            # BLOCK_Q=BLOCK_Q,
+            # BLOCK_KV=BLOCK_KV,
+            BLOCK_DIM=BLOCK_DIM,
+        )
+
+    if has_text:
+        if pad_size > 0:
+            output = output[:, :, :seq_length]
 
     return output
