@@ -2,12 +2,7 @@ import torch
 import math
 import sys
 import os
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
-attn_triton_dir = os.path.join(os.path.dirname(current_dir), "triton")
-sys.path.insert(0, attn_triton_dir)
-from sta_triton import triton_sliding_tile_attention
-
+from sta_rocm.triton.sta_triton import triton_sliding_tile_attention
 from flex_sta_ref import get_sliding_tile_attention_mask
 from torch.nn.attention.flex_attention import flex_attention
 from tqdm import tqdm

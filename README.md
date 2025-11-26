@@ -12,13 +12,13 @@ Recommended Docker Containers
 # For MI3XX
 ## Triton
 ### implement
-[sta_triton.py](attn/triton/sta_triton.py)
+[sta_triton.py](sta_rocm/triton/sta_triton.py)
 
 ### verify accuracy
-[test_sta_triton.py](attn/tests/test_sta_triton.py)
+[test_sta_triton.py](tests/test_sta_triton.py)
 
 ### benchmark
-[bench_sta_triton.py](attn/benchmarks/bench_sta_triton.py)
+[bench_sta_triton.py](benchmarks/bench_sta_triton.py)
 
 ## Hip (not yet)
 
