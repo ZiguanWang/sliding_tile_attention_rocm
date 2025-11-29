@@ -259,9 +259,6 @@ def triton_sliding_tile_attention(
         canvas_t, canvas_h, canvas_w = 18, 48, 80
         tile_t, tile_h, tile_w = 6, 8, 8
 
-    # all kernel_size is the same in window_size
-    kernel_size = window_size[0]
-    kernel_t, kernel_h, kernel_w = kernel_size
     img_seq_len = canvas_t * canvas_h * canvas_w
 
     num_tiles_t = canvas_t // tile_t
@@ -278,23 +275,32 @@ def triton_sliding_tile_attention(
     output = torch.empty_like(q)
 
     # for q_img
-    # triton_sta_kernel[(batch_size, num_heads, num_tiles * triton.cdiv(total_tile_size, BLOCK_Q))](
-    grid = lambda META: (batch_size, num_heads, num_tiles * triton.cdiv(total_tile_size, META['BLOCK_Q']))
-    triton_sta_kernel[grid](
-        q, k, v, output,
-        batch_size, num_heads, seq_len, head_dim,
-        img_seq_len,
-        text_length,
-        canvas_t, canvas_h, canvas_w,
-        kernel_t, kernel_h, kernel_w,
-        tile_t, tile_h, tile_w,
-        scale=1.0 / (head_dim ** 0.5),
-        has_text=has_text,
-        text_q=False,
-        # BLOCK_Q=BLOCK_Q,
-        # BLOCK_KV=BLOCK_KV,
-        BLOCK_DIM=BLOCK_DIM,
-    )
+    # kernel_size maybe different for different head
+    # This for loop is ugly. but it is actually quite efficient. The sequence dimension alone can already oversubscribe SMs
+    for head_index, (kernel_t, kernel_h, kernel_w) in enumerate(window_size):
+        for batch in range(batch_size):
+            q_head, k_head, v_head, o_head = (q[batch:batch + 1, head_index:head_index + 1],
+                                              k[batch:batch + 1, head_index:head_index + 1],
+                                              v[batch:batch + 1, head_index:head_index + 1],
+                                              output[batch:batch + 1, head_index:head_index + 1])
+
+            # triton_sta_kernel[(1, 1, num_tiles * triton.cdiv(total_tile_size, BLOCK_Q))](
+            grid = lambda META: (1, 1, num_tiles * triton.cdiv(total_tile_size, META['BLOCK_Q']))
+            triton_sta_kernel[grid](
+                q_head, k_head, v_head, o_head,
+                1, 1, seq_len, head_dim,
+                img_seq_len,
+                text_length,
+                canvas_t, canvas_h, canvas_w,
+                kernel_t, kernel_h, kernel_w,
+                tile_t, tile_h, tile_w,
+                scale=1.0 / (head_dim ** 0.5),
+                has_text=has_text,
+                text_q=False,
+                # BLOCK_Q=BLOCK_Q,
+                # BLOCK_KV=BLOCK_KV,
+                BLOCK_DIM=BLOCK_DIM,
+            )
 
     # for q_text
     if has_text:
@@ -306,7 +312,8 @@ def triton_sliding_tile_attention(
             img_seq_len,
             text_length,
             canvas_t, canvas_h, canvas_w,
-            kernel_t, kernel_h, kernel_w,
+            3, 3, 3,
+            #kernel_t, kernel_h, kernel_w,
             tile_t, tile_h, tile_w,
             scale=1.0 / (head_dim ** 0.5),
             has_text=has_text,
